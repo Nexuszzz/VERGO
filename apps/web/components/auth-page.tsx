@@ -1,0 +1,239 @@
+"use client";
+
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import Image from "next/image";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { ArrowLeft, Eye, EyeOff, LockKeyhole, Mail, RotateCw, UserRound } from "lucide-react";
+import { ApiError, completeMfaLogin, forgotPassword, getMe, isMfaLoginRequired, login, register, resendVerification, resetPassword, verifyEmail } from "../lib/api/client";
+import styles from "./auth-page.module.css";
+import BrandLogo from "./brand-logo";
+import { safeReturnTo } from "../lib/auth-return";
+import { useI18n } from "../lib/i18n/provider";
+
+
+type Mode = "login" | "signup";
+type Stage = "form" | "verify" | "forgot" | "reset" | "mfa";
+
+function usableEmailDomain(email: string) {
+  const domain = email.slice(email.lastIndexOf("@") + 1).toLowerCase();
+  const labels = domain.split(".");
+  return domain.length <= 253 && labels.length > 1
+    && labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+    && !/\.(test|invalid|example|localhost)$/.test(domain);
+}
+
+function Brand() {
+  const { t } = useI18n();
+  return (
+    <Link href="/" className={styles.brand} aria-label={t("VERGO, kembali ke beranda")}>
+      <BrandLogo width={250} />
+    </Link>
+  );
+}
+
+export default function AuthPage({ mode }: { mode: Mode }) {
+  const { t } = useI18n();
+  const router = useRouter();
+  const [returnTo, setReturnTo] = useState("/dashboard");
+  const isSignup = mode === "signup";
+  const [checkingSession, setCheckingSession] = useState(mode === "login");
+  const [stage, setStage] = useState<Stage>("form");
+  const [showPassword, setShowPassword] = useState(false);
+  const [remember, setRemember] = useState(false);
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [resendingCode, setResendingCode] = useState(false);
+  const [code, setCode] = useState("");
+  const [challengeId, setChallengeId] = useState("");
+  const [mfaPreauthToken, setMfaPreauthToken] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
+  const [mfaRecoveryMode, setMfaRecoveryMode] = useState(false);
+  const requestInFlight = useRef(false);
+
+  useEffect(() => {
+    setReturnTo(safeReturnTo(new URLSearchParams(window.location.search).get("returnTo")));
+    if (!isSignup) {
+      try {
+        const savedEmail = window.localStorage.getItem("sap-remembered-email");
+        if (savedEmail) {
+          setEmail(savedEmail);
+          setRemember(true);
+        }
+      } catch { /* Remembering an email is optional when browser storage is unavailable. */ }
+    }
+  }, [isSignup]);
+
+  useEffect(() => {
+    if (isSignup) {
+      setCheckingSession(false);
+      return;
+    }
+    setCheckingSession(true);
+    const controller = new AbortController();
+    getMe(controller.signal)
+      .then(() => {
+        if (controller.signal.aborted) return;
+        const destination = safeReturnTo(new URLSearchParams(window.location.search).get("returnTo"));
+        router.replace(destination);
+        router.refresh();
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setCheckingSession(false);
+      });
+    return () => controller.abort();
+  }, [isSignup, router]);
+
+  function rememberEmail(value: string) {
+    try {
+      if (remember) window.localStorage.setItem("sap-remembered-email", value);
+      else window.localStorage.removeItem("sap-remembered-email");
+    } catch { /* A storage failure must not interrupt a successful login. */ }
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (requestInFlight.current) return;
+    const fields = new FormData(event.currentTarget);
+    const submittedEmail = String(fields.get("email") ?? email).trim();
+    const submittedPassword = String(fields.get("password") ?? password);
+    const submittedName = String(fields.get("displayName") ?? name).trim();
+    if (isSignup && stage === "form" && !usableEmailDomain(submittedEmail)) {
+      setNotice("");
+      setError("Gunakan alamat email dengan domain publik yang valid. Domain .test, .invalid, .example, dan .localhost tidak dapat menerima kode verifikasi.");
+      return;
+    }
+    requestInFlight.current = true;
+    if (stage === "form" || stage === "forgot") setEmail(submittedEmail);
+    setError(""); setNotice(""); setBusy(true);
+    try {
+      if (stage === "mfa") {
+        await completeMfaLogin(mfaPreauthToken, mfaCode.trim());
+        setMfaPreauthToken(""); setMfaCode(""); setMfaRecoveryMode(false);
+        rememberEmail(submittedEmail);
+        router.replace(returnTo); router.refresh();
+      } else if (stage === "verify") {
+        await verifyEmail(challengeId, code);
+        router.replace(returnTo); router.refresh();
+      } else if (stage === "forgot") {
+        const challenge = await forgotPassword(submittedEmail);
+        setChallengeId(challenge.challengeId); setStage("reset");
+        setNotice("Jika email terdaftar, kode pemulihan telah dikirim. Periksa kotak masuk Anda.");
+      } else if (stage === "reset") {
+        await resetPassword(challengeId, code, submittedPassword);
+        setStage("form"); setCode(""); setPassword("");
+        setNotice("Kata sandi diperbarui. Silakan masuk.");
+      } else if (isSignup) {
+        const challenge = await register(submittedName, submittedEmail, submittedPassword);
+        setChallengeId(challenge.challengeId); setStage("verify"); setPassword("");
+        setNotice(challenge.message);
+      } else {
+        const result = await login(submittedEmail, submittedPassword);
+        if (isMfaLoginRequired(result)) {
+          setMfaPreauthToken(result.preauthToken);
+          setMfaCode(""); setMfaRecoveryMode(false); setStage("mfa");
+          setPassword("");
+          setNotice("Masukkan kode dari aplikasi autentikator atau gunakan kode pemulihan.");
+        } else {
+          rememberEmail(submittedEmail);
+          router.replace(returnTo); router.refresh();
+        }
+      }
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.code === "EMAIL_UNVERIFIED" && stage === "form" && !isSignup) {
+        try {
+          const challenge = await resendVerification(submittedEmail);
+          setChallengeId(challenge.challengeId); setStage("verify");
+          setNotice("Email belum diverifikasi. Kode telah dikirim kembali.");
+        } catch (retryCause) { setError(retryCause instanceof Error ? retryCause.message : "Kode belum dapat dikirim."); }
+      } else if (isSignup && stage === "form" && cause instanceof ApiError
+        && (cause.fields?.email || ["INVALID_EMAIL", "INVALID_EMAIL_DOMAIN", "EMAIL_DOMAIN_INVALID"].includes(cause.code))) {
+        setError("Alamat email tidak valid atau tidak dapat menerima pesan. Periksa alamat dan domain email Anda.");
+      } else setError(cause instanceof Error ? cause.message : "Permintaan belum berhasil. Coba lagi.");
+    } finally { requestInFlight.current = false; setBusy(false); }
+  }
+
+  async function resendCode() {
+    if (requestInFlight.current) return;
+    requestInFlight.current = true;
+    setBusy(true); setResendingCode(true); setError(""); setNotice("");
+    try { const challenge = stage === "reset" ? await forgotPassword(email.trim()) : await resendVerification(email.trim()); setChallengeId(challenge.challengeId); setCode(""); setNotice("Jika akun memenuhi syarat, kode baru telah dikirim."); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Kode belum dapat dikirim."); }
+    finally { requestInFlight.current = false; setBusy(false); setResendingCode(false); }
+  }
+
+  const title = stage === "mfa" ? "Verifikasi masuk" : stage === "verify" ? "Verifikasi email" : stage === "forgot" ? "Lupa kata sandi?" : stage === "reset" ? "Atur kata sandi baru" : isSignup ? "Buat akun VERGO" : "Selamat datang kembali";
+  const intro = stage === "mfa" ? mfaRecoveryMode ? "Masukkan salah satu kode pemulihan yang Anda simpan." : "Masukkan kode 6 digit dari aplikasi autentikator Anda." : stage === "verify" ? t("Masukkan enam digit kode yang dikirim ke {0}.", { "0": email }) : stage === "forgot" ? "Masukkan email akun untuk menerima kode pemulihan." : stage === "reset" ? "Masukkan kode dari email dan kata sandi baru." : isSignup ? "Mulai kenali sampah, laporkan penumpukan, dan pantau area." : "Masuk untuk melanjutkan aksi peduli lingkungan.";
+
+  return (
+    <main data-motion-scope className={`${styles.stage} ${isSignup ? styles.signup : styles.login}`}>
+      <div className={styles.browser}>
+        <section className={styles.paper} aria-label={t(title)}>
+          <div className={styles.formSide}>
+            <Brand />
+            {checkingSession ? <p className={styles.sessionCheck} role="status"><span aria-hidden="true" />{t("Memeriksa sesi akun…")}</p> : <div data-motion="card" data-motion-view={stage} className={styles.formContent}>
+              <h1>{t(title)}</h1>
+              <p className={styles.intro}>{t(intro)}</p>
+
+              <form className={styles.form} onSubmit={submit}>
+                {stage === "form" && isSignup && <div className={styles.fieldGroup}>
+                  <label htmlFor="auth-name">{t("Nama lengkap")}</label>
+                  <div className={styles.field}><UserRound size={23} /><input id="auth-name" name="displayName" type="text" autoComplete="name" placeholder={t("Nama lengkap")} value={name} onChange={event => setName(event.target.value)} minLength={2} maxLength={80} required /></div>
+                </div>}
+
+                {(stage === "form" || stage === "forgot") && <div className={styles.fieldGroup}>
+                  <label htmlFor="auth-email">Email</label>
+                  <div className={styles.field}><Mail size={22} /><input id="auth-email" name="email" type="email" autoComplete="email" placeholder="nama@email.com" value={email} onChange={event => setEmail(event.target.value)} required /></div>
+                </div>}
+
+                {(stage === "verify" || stage === "reset") && <div className={styles.fieldGroup}>
+                  <label htmlFor="auth-code">{t("Kode 6 digit")}</label>
+                  <div className={styles.field}><Mail size={22} /><input id="auth-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} placeholder="000000" value={code} onChange={event => setCode(event.target.value.replace(/\D/g, ""))} required /></div>
+                </div>}
+
+                {stage === "mfa" && <div className={styles.fieldGroup}>
+                  <label htmlFor="mfa-code">{mfaRecoveryMode ? t("Kode pemulihan") : t("Kode autentikator 6 digit")}</label>
+                  <div className={styles.field}><LockKeyhole size={22} /><input id="mfa-code" type="text" inputMode={mfaRecoveryMode ? "text" : "numeric"} autoComplete="one-time-code" pattern={mfaRecoveryMode ? "[A-Za-z2-7]{5}-?[A-Za-z2-7]{5}" : "[0-9]{6}"} maxLength={mfaRecoveryMode ? 11 : 6} placeholder={mfaRecoveryMode ? "ABCDE-FG234" : "000000"} value={mfaCode} onChange={event => setMfaCode(mfaRecoveryMode ? event.target.value.replace(/[^a-zA-Z2-7-]/g, "").slice(0, 11) : event.target.value.replace(/\D/g, "").slice(0, 6))} required /></div>
+                  <button className={styles.textButton} type="button" onClick={() => { setMfaRecoveryMode(value => !value); setMfaCode(""); setError(""); setNotice(""); }}>{mfaRecoveryMode ? t("Gunakan kode autentikator") : t("Gunakan kode pemulihan")}</button>
+                </div>}
+
+                {(stage === "form" || stage === "reset") && <div className={styles.fieldGroup}>
+                  <label htmlFor="auth-password">{stage === "reset" ? t("Kata sandi baru") : t("Kata sandi")}</label>
+                  <div className={styles.field}><LockKeyhole size={22} /><input id="auth-password" name="password" type={showPassword ? "text" : "password"} autoComplete={stage === "reset" || isSignup ? "new-password" : "current-password"} placeholder={stage === "reset" || isSignup ? t("Minimal 12 karakter") : t("Kata sandi")} value={password} onChange={event => setPassword(event.target.value)} minLength={stage === "reset" || isSignup ? 12 : 1} maxLength={128} required /><button className={styles.reveal} type="button" onClick={() => setShowPassword(value => !value)} aria-label={showPassword ? t("Sembunyikan kata sandi") : t("Tampilkan kata sandi")} aria-pressed={showPassword}>{showPassword ? <EyeOff size={23} /> : <Eye size={23} />}</button></div>
+                </div>}
+
+                {stage === "form" && !isSignup && <div className={styles.options}><label className={styles.remember}><input type="checkbox" checked={remember} onChange={event => setRemember(event.target.checked)} /><span className={styles.customCheck} aria-hidden="true" />{t("Ingat email saya")}</label><button type="button" className={styles.textButton} onClick={() => { setStage("forgot"); setError(""); setNotice(""); }}>{t("Lupa kata sandi?")}</button></div>}
+
+                <button className={styles.submit} type="submit" disabled={busy} aria-busy={busy && !resendingCode}>{busy && !resendingCode ? t("Memproses…") : stage === "mfa" ? t("Verifikasi & masuk") : stage === "verify" ? t("Verifikasi & masuk") : stage === "forgot" ? t("Kirim kode") : stage === "reset" ? t("Simpan kata sandi") : isSignup ? t("Daftar akun") : t("Masuk")}</button>
+                {stage === "mfa" && <p className={styles.securityNote}>{t("Kunci sementara login ini hanya berlaku untuk menyelesaikan verifikasi.")}</p>}
+                {stage === "verify" && <p className={styles.securityNote}>{t("Email yang sudah terverifikasi tidak menerima kode pendaftaran baru.")} <Link href={`/login?returnTo=${encodeURIComponent(returnTo)}`}>{t("Masuk")}</Link></p>}
+                {stage !== "form" && <div className={styles.secondaryActions}>
+                  <button className={styles.backAction} type="button" disabled={busy} onClick={() => { const leavingMfa = stage === "mfa"; setStage("form"); setCode(""); setError(""); setNotice(""); if (leavingMfa) { setMfaCode(""); setMfaPreauthToken(""); setMfaRecoveryMode(false); } }}>
+                    <ArrowLeft size={20} aria-hidden="true" />
+                    <span>{stage === "mfa" ? t("Batal dan kembali ke login") : t("Kembali")}</span>
+                  </button>
+                  {stage === "verify" && <button className={styles.resendAction} type="button" disabled={busy} aria-busy={resendingCode} onClick={resendCode}>
+                    <RotateCw size={21} className={resendingCode ? styles.resendIconBusy : undefined} aria-hidden="true" />
+                    <span>{resendingCode ? t("Mengirim…") : t("Kirim ulang kode")}</span>
+                  </button>}
+                </div>}
+                {error ? <p className={styles.notice} role="alert">{t(error)}</p> : notice && <p className={styles.notice} role="status">{t(notice)}</p>}
+              </form>
+
+              {stage === "form" && <p className={styles.switch}>{isSignup ? t("Sudah punya akun?") : t("Belum punya akun?")} <Link href={`${isSignup ? "/login" : "/signup"}?returnTo=${encodeURIComponent(returnTo)}`}>{isSignup ? t("Masuk") : t("Daftar akun")}</Link></p>}
+            </div>}
+          </div>
+
+          <div className={styles.sceneSide}>
+            <Image className={styles.scene} src={isSignup ? "/images/auth/signup-scene.webp" : "/images/auth/login-scene.webp"} alt={isSignup ? t("Taman kota hijau dengan fasilitas pemilahan sampah dan ponsel pemindai") : t("Taman kota hijau dengan ponsel pemindai botol dan tempat sampah terpilah")} fill priority sizes="(max-width: 800px) 100vw, 54vw" />
+          </div>
+        </section>
+
+      </div>
+    </main>
+  );
+}

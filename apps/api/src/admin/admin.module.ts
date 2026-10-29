@@ -1,0 +1,41 @@
+import { Module } from '@nestjs/common';
+import { CommunityModule } from '../community/community.module.js';
+import { ActivitiesModule } from '../activities/activities.module.js';
+import { DatabaseModule } from '../infrastructure/database.module.js';
+import { IdempotencyStore } from '../infrastructure/idempotency.store.js';
+import { MediaRepository } from '../media/media.repository.js';
+import { ReportRepository } from '../reports/report.repository.js';
+import { SessionRepository } from '../session/session.repository.js';
+import { SessionAuthGuard } from '../auth/session-auth.guard.js';
+import { AdminController } from './admin.controller.js';
+import { AdminGuard } from './admin.guard.js';
+import { AdminService } from './admin.service.js';
+import { AuditRepository } from './audit.repository.js';
+import { ModerationRepository } from './moderation.repository.js';
+import { ScanSettingsRepository } from './scan-settings.repository.js';
+import { ScanSettingsService } from './scan-settings.service.js';
+import { ExtensionStore } from '../extensions/extension.store.js';
+import { OperationsService } from './operations.service.js';
+import { OperationsAdminController, OperationsAreaController, OperationsPublicLocalitiesController, OperationsUserController } from './operations.controller.js';
+
+@Module({
+  imports: [DatabaseModule, CommunityModule, ActivitiesModule],
+  controllers: [AdminController, OperationsAdminController, OperationsUserController, OperationsAreaController, OperationsPublicLocalitiesController],
+  providers: [
+    AdminService,
+    OperationsService,
+    ScanSettingsService,
+    ScanSettingsRepository,
+    ModerationRepository,
+    AuditRepository,
+    ReportRepository,
+    IdempotencyStore,
+    ExtensionStore,
+    MediaRepository,
+    SessionRepository,
+    SessionAuthGuard,
+    AdminGuard,
+  ],
+  exports: [AdminService],
+})
+export class AdminModule {}

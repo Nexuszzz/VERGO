@@ -1,0 +1,360 @@
+/**
+ * SAPA curated FAQ knowledge base (SAPA_ASSISTANT.md §18). The service retrieves
+ * entries relevant to the page + question and may combine them with approved
+ * corpus passages or read-only, caller-scoped query tools. This FAQ alone is not
+ * proof that an answer is grounded or factually correct. Entries carry no PII,
+ * coordinates, media, or invented statistics. Items still marked
+ * `TODO-VERIFIKASI` deliberately steer to Bantuan instead of quoting a number.
+ */
+import {
+  CITATION_SNIPPET_MAX,
+  CITATION_SOURCE_MAX,
+  CITATION_TITLE_MAX,
+  CITATIONS_MAX,
+  type Citation,
+  type PageContext,
+  type SuggestedAction,
+} from './assistant.types.js';
+import { stripStopwords } from './indonesian-stopwords.js';
+
+export interface KnowledgeEntry {
+  readonly id: string;
+  /** Retrieval tag: the page this entry is most relevant to. */
+  readonly pageContext: PageContext;
+  readonly question: string;
+  readonly answer: string;
+  readonly suggestedActions: SuggestedAction[];
+  /**
+   * Provenance for citation cards. Curated FAQ entries default to the internal
+   * "FAQ SAP" source with no external URL; sourced corpus entries added later
+   * carry a real publisher label and `url`. Never invent a URL for FAQ text.
+   */
+  readonly source?: string;
+  readonly url?: string | null;
+}
+
+/** Default provenance label for internal FAQ entries with no external source. */
+const DEFAULT_SOURCE = 'FAQ SAP';
+
+export const KNOWLEDGE_BASE: readonly KnowledgeEntry[] = [
+  // Scan
+  {
+    id: 'scan-cara',
+    pageContext: 'scan',
+    question: 'Bagaimana cara scan sampah?',
+    answer:
+      'Buka halaman Scan, ambil atau unggah satu foto sampah yang jelas dan cukup terang, lalu tunggu hasilnya. SAPA tidak memindai untukmu — kamu yang mengambil fotonya.',
+    suggestedActions: [{ label: 'Buka Scan', target: 'scan' }],
+  },
+  {
+    id: 'scan-foto-jelas',
+    pageContext: 'scan',
+    question: 'Bagaimana foto yang baik untuk scan?',
+    answer:
+      'Pastikan objek terlihat penuh, pencahayaan cukup, dan tidak buram. Satu foto per scan sudah cukup.',
+    suggestedActions: [{ label: 'Buka Scan', target: 'scan' }],
+  },
+  {
+    id: 'scan-hasil',
+    pageContext: 'scan_history',
+    question: 'Apa arti hasil scan saya?',
+    answer:
+      "Hasil bisa berupa satu kategori sampah yang dikenali, 'tidak ada sampah', atau 'tidak dikenali/campuran' bila model ragu. Riwayat scan menyimpan hasil-hasil sebelumnya.",
+    suggestedActions: [{ label: 'Riwayat scan', target: 'scan_history' }],
+  },
+  {
+    id: 'scan-gagal',
+    pageContext: 'scan',
+    question: 'Kenapa scan saya gagal?',
+    answer:
+      'Scan bisa gagal bila foto tidak didukung atau layanan pengenalan sedang tidak tersedia. Coba lagi dengan foto lain; jika terus gagal, buka Bantuan.',
+    suggestedActions: [
+      { label: 'Coba lagi', target: 'scan' },
+      { label: 'Bantuan', target: 'help' },
+    ],
+  },
+  // Laporan
+  {
+    id: 'report-buat',
+    pageContext: 'my_reports',
+    question: 'Bagaimana cara membuat laporan penumpukan sampah?',
+    answer:
+      'Buka menu Laporan, isi lokasi dan foto penumpukan, lalu kirim. Laporan baru berstatus menunggu pemeriksaan sebelum tampil di peta publik.',
+    suggestedActions: [{ label: 'Laporan saya', target: 'my_reports' }],
+  },
+  {
+    id: 'report-status',
+    pageContext: 'my_reports',
+    question: 'Apa arti status laporan?',
+    answer:
+      'Menunggu pemeriksaan: baru dikirim. Terverifikasi: sudah dicek admin. Sedang ditangani: dalam penanganan. Selesai: sudah ditangani. Duplikat: sama dengan laporan lain di dekatnya.',
+    suggestedActions: [{ label: 'Laporan saya', target: 'my_reports' }],
+  },
+  {
+    id: 'report-belum-peta',
+    pageContext: 'my_reports',
+    question: 'Kenapa laporan saya belum muncul di peta?',
+    answer:
+      'Peta hanya menampilkan laporan yang sudah diverifikasi. Laporan yang baru dikirim masih menunggu pemeriksaan. Cek statusnya di Laporan saya.',
+    suggestedActions: [{ label: 'Laporan saya', target: 'my_reports' }],
+  },
+  // Peta area
+  {
+    id: 'map-baca',
+    pageContext: 'areas',
+    question: 'Bagaimana cara membaca peta area rawan?',
+    answer:
+      'Peta merangkum kejadian dari laporan terverifikasi per area. Warna/intensitas menandai tingkat kerawanan berdasarkan jumlah kejadian, bukan ramalan masa depan.',
+    suggestedActions: [{ label: 'Buka Peta', target: 'areas' }],
+  },
+  {
+    id: 'map-belum-data',
+    pageContext: 'areas',
+    question: 'Mengapa area ini belum punya data?',
+    answer:
+      'Artinya belum ada laporan terverifikasi di area itu pada rentang waktu yang dipilih. Ini bukan berarti area pasti bersih — hanya belum ada data.',
+    suggestedActions: [{ label: 'Buka Peta', target: 'areas' }],
+  },
+  {
+    id: 'map-risiko',
+    pageContext: 'areas',
+    question: 'Bagaimana tingkat kerawanan dihitung?',
+    answer:
+      'Kerawanan dihitung dari banyaknya kejadian terverifikasi dan seberapa sering terjadi di area itu; makin banyak dan makin sering, makin tinggi. Untuk ambang pastinya, lihat halaman Bantuan.',
+    suggestedActions: [{ label: 'Buka Peta', target: 'areas' }],
+  },
+  // Poin & pencapaian. Nilai/ambang pasti sengaja TIDAK dikutip (TODO-VERIFIKASI
+  // PRD §7); jawaban mengarahkan ke Bantuan agar tidak ada angka yang ditebak.
+  {
+    id: 'poin-scan',
+    pageContext: 'achievements',
+    question: 'Bagaimana cara dapat poin dari scan?',
+    answer:
+      'Scan yang berhasil mengenali kategori sampah memberi poin, dengan batas harian. Untuk nilai dan batas pastinya, lihat halaman Bantuan.',
+    suggestedActions: [{ label: 'Pencapaian', target: 'achievements' }],
+  },
+  {
+    id: 'poin-laporan',
+    pageContext: 'achievements',
+    question: 'Bagaimana poin dari laporan?',
+    answer:
+      'Laporan yang terverifikasi memberi poin, dengan batas harian. Untuk nilai dan batas pastinya, lihat halaman Bantuan.',
+    suggestedActions: [{ label: 'Pencapaian', target: 'achievements' }],
+  },
+  {
+    id: 'badge',
+    pageContext: 'achievements',
+    question: 'Bagaimana cara membuka lencana?',
+    answer:
+      'Lencana terbuka dari aktivitas dan poin yang terkumpul. Untuk daftar dan syarat lencana, lihat halaman Bantuan.',
+    suggestedActions: [{ label: 'Pencapaian', target: 'achievements' }],
+  },
+  // Pengaturan & privasi
+  {
+    id: 'privasi-foto-lokasi',
+    pageContext: 'settings',
+    question: 'Bagaimana foto dan lokasi saya digunakan?',
+    answer:
+      'Foto dan lokasi laporanmu bersifat privat. Data yang tampil publik hanya ringkasan area dan informasi yang aman; foto dan koordinat tepatmu tidak dibagikan.',
+    suggestedActions: [
+      { label: 'Pengaturan', target: 'settings' },
+      { label: 'Bantuan', target: 'help' },
+    ],
+  },
+  {
+    id: 'sapa-toggle',
+    pageContext: 'settings',
+    question: 'Bagaimana mematikan atau menyalakan SAPA?',
+    answer:
+      "Buka Pengaturan lalu ubah sakelar 'Teman virtual SAPA'. Mematikannya menyembunyikan ikon SAPA; kamu tetap bisa membuka halaman Bantuan.",
+    suggestedActions: [{ label: 'Pengaturan', target: 'settings' }],
+  },
+  // Bantuan / fallback (selalu disertakan sebagai pengaman)
+  {
+    id: 'fallback-unknown',
+    pageContext: 'help',
+    question: 'Fakta SAP yang tidak ada di KONTEKS',
+    answer:
+      'KONTEKS adalah referensi untuk fakta khusus SAP, bukan batas topik. Pertanyaan umum tentang alam, lingkungan, ekologi, sampah, daur ulang, iklim, dan keberlanjutan boleh dijawab dengan pengetahuan yang tersedia. Untuk detail produk SAP yang tidak ada di referensi, jelaskan bahwa kamu belum dapat memastikannya dan arahkan ke Bantuan. Jangan membantu coding atau topik yang tidak terkait SAP/lingkungan.',
+    suggestedActions: [{ label: 'Buka Bantuan', target: 'help' }],
+  },
+  {
+    id: 'luar-lingkup',
+    pageContext: 'help',
+    question: 'SAPA bisa melakukan aksi atau mengubah data SAP untukku?',
+    answer:
+      'Aku tidak bisa membuat, mengubah, atau memverifikasi data SAP atas namamu. Kamu bisa melakukannya sendiri di halaman terkait; aku tetap bisa membantu menyusun teks atau menjelaskan langkahnya.',
+    suggestedActions: [
+      { label: 'Laporan saya', target: 'my_reports' },
+      { label: 'Bantuan', target: 'help' },
+    ],
+  },
+];
+
+/** Safety-net entries always injected regardless of page/query (§18 note). */
+const SAFETY_NET_IDS = ['fallback-unknown', 'luar-lingkup'] as const;
+
+/** Whether a KB/corpus entry is one of the always-present safety-net entries. */
+export function isSafetyNetId(id: string): boolean {
+  return (SAFETY_NET_IDS as readonly string[]).includes(id);
+}
+
+/** Max KB entries injected per call — keep KONTEKS small to save tokens & focus. */
+export const MAX_RETRIEVED = 6;
+
+/** Page-tagged entries get this boost so suggestions match the current screen. */
+const PAGE_BOOST = 3;
+
+function tokenize(text: string): string[] {
+  return stripStopwords(text);
+}
+
+/**
+ * Retrieve the KB entries most relevant to the active page and the user's
+ * question. Page-tagged entries get a boost so suggestions match the current
+ * screen; a lightweight token overlap ranks the rest. Safety-net entries preserve
+ * SAP-specific accuracy and explain the read-only boundary without restricting
+ * unrelated general questions.
+ */
+export function retrieveKnowledge(message: string, pageContext: PageContext): KnowledgeEntry[] {
+  const queryTokens = new Set(tokenize(message));
+  const scored = KNOWLEDGE_BASE.map((entry) => {
+    const entryTokens = tokenize(`${entry.question} ${entry.answer}`);
+    let overlap = 0;
+    for (const token of entryTokens) if (queryTokens.has(token)) overlap += 1;
+    const pageBoost = entry.pageContext === pageContext ? PAGE_BOOST : 0;
+    return { entry, score: overlap + pageBoost };
+  });
+
+  const selected = new Map<string, KnowledgeEntry>();
+  for (const id of SAFETY_NET_IDS) {
+    const entry = KNOWLEDGE_BASE.find((item) => item.id === id);
+    if (entry) selected.set(entry.id, entry);
+  }
+
+  scored
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score)
+    .forEach(({ entry }) => {
+      if (selected.size < MAX_RETRIEVED) selected.set(entry.id, entry);
+    });
+
+  return [...selected.values()];
+}
+
+/** Render SAP reference entries prepended to the user turn. */
+export function buildContextBlock(entries: KnowledgeEntry[], pageContext: PageContext): string {
+  const lines = entries.map((entry) => {
+    const actions = entry.suggestedActions.map((action) => `${action.label}->${action.target}`).join(', ');
+    return `- (${entry.id}) T: ${entry.question}\n  J: ${entry.answer}\n  saran: [${actions}]`;
+  });
+  return [
+    `REFERENSI SAP (pageContext aktif: ${pageContext}). Gunakan entri berikut untuk fakta khusus SAP yang relevan; ini bukan batas topik. Pertanyaan umum tentang alam, lingkungan, sampah, daur ulang, iklim, dan keberlanjutan boleh dijawab dengan pengetahuan umum. Jangan mengarang detail produk SAP yang tidak tercantum:`,
+    ...lines,
+  ].join('\n');
+}
+
+/**
+ * Resolve the KONTEKS entry ids the model claims it grounded on into structured
+ * citation cards. Only ids that were actually part of the retrieved set become
+ * cards, so a hallucinated id can never surface a source. Order follows the
+ * model's list, duplicates are dropped, and the count is capped for the UI.
+ */
+export function toCitations(retrieved: KnowledgeEntry[], citedIds: string[]): Citation[] {
+  const byId = new Map(retrieved.map((entry) => [entry.id, entry]));
+  const cards: Citation[] = [];
+  const seen = new Set<string>();
+  for (const id of citedIds) {
+    if (seen.has(id)) continue;
+    const entry = byId.get(id);
+    if (!entry) continue;
+    seen.add(id);
+    cards.push({
+      id: entry.id,
+      title: entry.question.slice(0, CITATION_TITLE_MAX),
+      snippet: entry.answer.slice(0, CITATION_SNIPPET_MAX),
+      source: (entry.source ?? DEFAULT_SOURCE).slice(0, CITATION_SOURCE_MAX),
+      url: entry.url ?? null,
+    });
+    if (cards.length >= CITATIONS_MAX) break;
+  }
+  return cards;
+}
+
+/**
+ * A raw `sapa_corpus` row as returned by postgres.js (snake_case columns;
+ * `suggested_actions` arrives already-parsed as JSON). Kept structural so the
+ * repository does not need to import a driver row type.
+ */
+export interface CorpusRow {
+  id: string;
+  page_context: string;
+  question: string;
+  answer: string;
+  suggested_actions: unknown;
+  source: string | null;
+  url: string | null;
+}
+
+/** Coerce a stored jsonb actions array back into validated SuggestedAction[]. */
+function coerceActions(value: unknown): SuggestedAction[] {
+  if (!Array.isArray(value)) return [];
+  const actions: SuggestedAction[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue;
+    const { label, target } = item as { label?: unknown; target?: unknown };
+    if (typeof label === 'string' && typeof target === 'string') {
+      actions.push({ label, target: target as SuggestedAction['target'] });
+    }
+  }
+  return actions;
+}
+
+/** Map a corpus row to the same KnowledgeEntry shape the KB path produces. */
+export function corpusRowToEntry(row: CorpusRow): KnowledgeEntry {
+  return {
+    id: row.id,
+    pageContext: row.page_context as PageContext,
+    question: row.question,
+    answer: row.answer,
+    suggestedActions: coerceActions(row.suggested_actions),
+    ...(row.source ? { source: row.source } : {}),
+    url: row.url ?? null,
+  };
+}
+
+/** A row ready to upsert into `sapa_corpus` (content_search stripped app-side). */
+export interface CorpusSeedRow {
+  id: string;
+  pageContext: PageContext;
+  question: string;
+  answer: string;
+  suggestedActions: SuggestedAction[];
+  source: string | null;
+  url: string | null;
+  isSafetyNet: boolean;
+  contentSearch: string;
+}
+
+/** Build the stop-word-stripped search text stored in `content_search`. */
+export function buildContentSearch(question: string, answer: string): string {
+  return stripStopwords(`${question} ${answer}`).join(' ');
+}
+
+/**
+ * Derive the seed corpus (text only, no embeddings) from the curated KB. Seeding
+ * writes these rows idempotently; a separate CLI backfills their embedding vector.
+ */
+export function knowledgeBaseSeedRows(): CorpusSeedRow[] {
+  return KNOWLEDGE_BASE.map((entry) => ({
+    id: entry.id,
+    pageContext: entry.pageContext,
+    question: entry.question,
+    answer: entry.answer,
+    suggestedActions: entry.suggestedActions,
+    source: entry.source ?? null,
+    url: entry.url ?? null,
+    isSafetyNet: isSafetyNetId(entry.id),
+    contentSearch: buildContentSearch(entry.question, entry.answer),
+  }));
+}

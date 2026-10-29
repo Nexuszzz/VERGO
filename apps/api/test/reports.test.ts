@@ -1,0 +1,405 @@
+import 'reflect-metadata';
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
+import type { HttpException } from '@nestjs/common';
+import { ReportsService } from '../src/reports/reports.service.js';
+import { isOccurredAtValid, toReportView, type ReportRecord } from '../src/reports/report.types.js';
+import { toH3Cell } from '../src/reports/geo.js';
+import { ReportInputDto, ReportUpdateInputDto } from '../src/reports/dto.js';
+import type { UpdateReportResult } from '../src/reports/report.repository.js';
+
+function errorCode(error: unknown): string {
+  const body = (error as HttpException).getResponse?.();
+  return typeof body === 'object' && body !== null ? (body as { code?: string }).code ?? '' : '';
+}
+
+const KEY = '11111111-1111-1111-1111-111111111111';
+const MEDIA = '22222222-2222-4222-8222-222222222222';
+const REPORT = '33333333-3333-3333-3333-333333333333';
+
+function record(over: Partial<ReportRecord> = {}): ReportRecord {
+  return {
+    id: REPORT,
+    revision: 1,
+    status: 'submitted',
+    categoryId: null,
+    scanId: null,
+    description: 'x'.repeat(25),
+    observationSource: null,
+    inference: null,
+    sourceReference: null,
+    contextFlags: [],
+    photoUnavailableReason: null,
+    reportedSeverity: 'small',
+    latitude: -6.2,
+    longitude: 106.8,
+    occurredAt: new Date('2026-09-25T00:00:00.000Z'),
+    createdAt: new Date('2026-09-25T00:00:00.000Z'),
+    updatedAt: new Date('2026-09-25T00:00:00.000Z'),
+    publicSummary: null,
+    duplicateOfId: null,
+    evidenceMediaIds: [MEDIA],
+    resolutionMediaIds: [],
+    publishedMediaIds: [],
+    timeline: [
+      { id: 'e1', toStatus: 'submitted', reason: null, occurredAt: new Date('2026-09-25T00:00:00.000Z') },
+    ],
+    ...over,
+  };
+}
+
+interface Stub {
+  service: ReportsService;
+  state: { created: number };
+  createArgs: Array<Record<string, unknown>>;
+  updateArgs: Array<{ reportId: string; revision: number; changes: Record<string, unknown> }>;
+}
+
+function makeService(opts: {
+  ownedMedia?: boolean;
+  mediaPurpose?: 'report' | 'scan';
+  ownedScan?: boolean;
+  createReplayed?: boolean;
+  found?: ReportRecord | null;
+  listRows?: ReportRecord[];
+  updateResult?: UpdateReportResult;
+  recentCount?: number;
+} = {}): Stub {
+  const state = { created: 0 };
+  const createArgs: Array<Record<string, unknown>> = [];
+  const updateArgs: Array<{ reportId: string; revision: number; changes: Record<string, unknown> }> = [];
+  const media = {
+    findStoredForOwner: async (id: string) => (opts.ownedMedia === false ? null : { id, ownerId: 'u1', purpose: opts.mediaPurpose ?? 'report' }),
+  };
+  const scans = {
+    findByIdForOwner: async (id: string) => (opts.ownedScan === false ? null : { id }),
+  };
+  const reports = {
+    createIdempotent: async (input: Record<string, unknown>) => {
+      state.created += 1;
+      createArgs.push(input);
+      return { view: {} as never, replayed: opts.createReplayed ?? false };
+    },
+    findForViewer: async () => opts.found === undefined ? record() : opts.found,
+    listByOwner: async (_u: string, limit: number) => (opts.listRows ?? []).slice(0, limit),
+    updateOwnedSubmitted: async (reportId: string, _u: string, revision: number, changes: Record<string, unknown>) => {
+      updateArgs.push({ reportId, revision, changes });
+      return opts.updateResult ?? ({ ok: true, record: record() } as UpdateReportResult);
+    },
+    countRecentForUser: async (_u: string, _since: Date) => ({
+      count: opts.recentCount ?? 0,
+      oldestAt: opts.recentCount ? new Date(Date.now() - 12 * 60 * 60 * 1_000) : null,
+    }),
+  };
+  const service = new ReportsService(reports as never, media as never, scans as never);
+  return { service, state, createArgs, updateArgs };
+}
+
+function nowIso(offsetMs = 0): string {
+  return new Date(Date.now() + offsetMs).toISOString();
+}
+
+function input(over: Partial<ReportInputDto> = {}): ReportInputDto {
+  return {
+    mediaIds: [MEDIA],
+    description: 'Tumpukan sampah di pinggir sungai dekat pasar.',
+    location: { latitude: -6.2, longitude: 106.8 },
+    occurredAt: nowIso(-60_000),
+    reportedSeverity: 'small',
+    observationSource: 'firsthand',
+    ...over,
+  } as ReportInputDto;
+}
+
+test('toH3Cell yields a res-9 cell id (15 hex chars)', () => {
+  const cell = toH3Cell(-6.2, 106.8);
+  assert.match(cell, /^[0-9a-f]{15}$/);
+});
+
+test('isOccurredAtValid rejects the future and anything older than 30 days', () => {
+  const now = Date.parse('2026-09-25T00:00:00Z');
+  assert.equal(isOccurredAtValid(new Date(now - 1000), now), true);
+  assert.equal(isOccurredAtValid(new Date(now + 60_000), now), false, 'future is invalid');
+  assert.equal(isOccurredAtValid(new Date(now - 31 * 24 * 3600 * 1000), now), false, '>30 days is invalid');
+  assert.equal(isOccurredAtValid(new Date('nope'), now), false);
+});
+
+test('createReport rejects an occurredAt in the future with REPORT_INVALID', async () => {
+  const { service } = makeService();
+  await assert.rejects(
+    service.createReport('u1', input({ occurredAt: nowIso(60_000) }), KEY),
+    (e) => errorCode(e) === 'REPORT_INVALID',
+  );
+});
+
+test('createReport rejects media the caller does not own with NOT_FOUND', async () => {
+  const { service } = makeService({ ownedMedia: false });
+  await assert.rejects(service.createReport('u1', input(), KEY), (e) => errorCode(e) === 'NOT_FOUND');
+});
+
+test('createReport rejects stored media uploaded for another purpose', async () => {
+  const { service } = makeService({ mediaPurpose: 'scan' });
+  await assert.rejects(service.createReport('u1', input(), KEY), (e) => errorCode(e) === 'EVIDENCE_INVALID');
+});
+
+test('createReport rejects a scanId the caller does not own with NOT_FOUND', async () => {
+  const { service } = makeService({ ownedScan: false });
+  await assert.rejects(
+    service.createReport('u1', input({ scanId: '44444444-4444-4444-4444-444444444444' }), KEY),
+    (e) => errorCode(e) === 'NOT_FOUND',
+  );
+});
+
+test('createReport creates a report for valid, owned input', async () => {
+  const stub = makeService();
+  await stub.service.createReport('u1', input(), KEY);
+  assert.equal(stub.state.created, 1);
+});
+
+test('createReport passes publication consent into the atomic report creation input', async () => {
+  const stub = makeService();
+  await stub.service.createReport('u1', input({ publicationChannels: ['web', 'instagram'] }), KEY, true);
+  assert.deepEqual(stub.createArgs[0]?.publicationChannels, ['web', 'instagram']);
+});
+
+test('createReport requires a verified email before granting publication consent', async () => {
+  const stub = makeService();
+  await assert.rejects(
+    stub.service.createReport('u1', input({ publicationChannels: ['web'] }), KEY),
+    (error) => errorCode(error) === 'EMAIL_VERIFICATION_REQUIRED',
+  );
+  assert.equal(stub.state.created, 0);
+});
+
+test('ReportInputDto accepts only unique publication channels', async () => {
+  const valid = plainToInstance(ReportInputDto, input({ publicationChannels: ['web', 'instagram'] }));
+  assert.equal((await validate(valid)).some(error => error.property === 'publicationChannels'), false);
+
+  for (const publicationChannels of [['web', 'web'], ['web', 'public'], null]) {
+    const dto = plainToInstance(ReportInputDto, input({ publicationChannels } as never));
+    assert.equal((await validate(dto)).some(error => error.property === 'publicationChannels'), true);
+  }
+});
+
+test('createReport enforces the per-account rate limit with RATE_LIMITED', async () => {
+  const stub = makeService({ recentCount: 10 });
+  await assert.rejects(stub.service.createReport('u1', input(), KEY), (e) => errorCode(e) === 'RATE_LIMITED');
+  assert.equal(stub.state.created, 0, 'a throttled report is never created');
+});
+
+test('getReport returns NOT_FOUND when the viewer cannot see it', async () => {
+  const { service } = makeService({ found: null });
+  await assert.rejects(service.getReport('u1', false, REPORT), (e) => errorCode(e) === 'NOT_FOUND');
+});
+
+test('getReport maps a visible report to the contract view', async () => {
+  const { service } = makeService({ found: record({ categoryId: 'plastic' }) });
+  const view = await service.getReport('u1', false, REPORT);
+  assert.equal(view.id, REPORT);
+  assert.equal(view.status, 'submitted');
+  assert.equal(view.categoryId, 'plastic');
+  assert.deepEqual(view.location, { latitude: -6.2, longitude: 106.8 });
+  assert.deepEqual(view.mediaIds, [MEDIA]);
+  assert.deepEqual(view.resolutionMediaIds, []);
+  assert.equal(view.publicSummary, null);
+  assert.equal(view.timeline.length, 1);
+  assert.equal(view.timeline[0]!.status, 'submitted');
+  assert.equal(view.timeline[0]!.note, '');
+});
+
+test('listMyReports reports nextCursor only when another page exists', async () => {
+  const rows = [record({ id: 'r0' }), record({ id: 'r1' }), record({ id: 'r2' })];
+  const withMore = makeService({ listRows: rows });
+  const page = await withMore.service.listMyReports('u1', 2, undefined, undefined);
+  assert.equal(page.items.length, 2);
+  assert.equal(page.nextCursor, 'r1');
+
+  const exact = makeService({ listRows: rows.slice(0, 2) });
+  const page2 = await exact.service.listMyReports('u1', 2, undefined, undefined);
+  assert.equal(page2.nextCursor, null);
+});
+
+test('updateReport rejects an empty change set with VALIDATION_ERROR', async () => {
+  const { service } = makeService();
+  await assert.rejects(
+    service.updateReport('u1', REPORT, 1, {} as ReportUpdateInputDto),
+    (e) => errorCode(e) === 'VALIDATION_ERROR',
+  );
+});
+
+test('updateReport surfaces a stale revision as REVISION_CONFLICT', async () => {
+  const { service } = makeService({ updateResult: { ok: false, reason: 'conflict' } });
+  await assert.rejects(
+    service.updateReport('u1', REPORT, 1, { description: 'y'.repeat(25) } as ReportUpdateInputDto),
+    (e) => errorCode(e) === 'REVISION_CONFLICT',
+  );
+});
+
+test('updateReport surfaces a non-submitted report as FORBIDDEN', async () => {
+  const { service } = makeService({ updateResult: { ok: false, reason: 'not_editable' } });
+  await assert.rejects(
+    service.updateReport('u1', REPORT, 1, { description: 'y'.repeat(25) } as ReportUpdateInputDto),
+    (e) => errorCode(e) === 'FORBIDDEN',
+  );
+});
+
+test('updateReport surfaces an unknown/foreign report as NOT_FOUND', async () => {
+  const { service } = makeService({ updateResult: { ok: false, reason: 'not_found' } });
+  await assert.rejects(
+    service.updateReport('u1', REPORT, 1, { description: 'y'.repeat(25) } as ReportUpdateInputDto),
+    (e) => errorCode(e) === 'NOT_FOUND',
+  );
+});
+
+test('updateReport passes the If-Match revision through and validates new media', async () => {
+  const stub = makeService();
+  await stub.service.updateReport('u1', REPORT, 7, { mediaIds: [MEDIA] } as ReportUpdateInputDto);
+  assert.equal(stub.updateArgs[0]?.reportId, REPORT);
+  assert.equal(stub.updateArgs[0]?.revision, 7);
+  assert.deepEqual(stub.updateArgs[0]?.changes, { mediaIds: [MEDIA], photoUnavailableReason: null });
+});
+
+test('updateReport ignores an own categoryId property whose transformed value is undefined', async () => {
+  const stub = makeService();
+  const dto = plainToInstance(ReportUpdateInputDto, {
+    description: 'Updated report description with enough length.',
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(dto, 'categoryId'), true);
+  assert.equal(dto.categoryId, undefined);
+
+  await stub.service.updateReport('u1', REPORT, 1, dto);
+
+  assert.deepEqual(stub.updateArgs[0]?.changes, { description: 'Updated report description with enough length.' });
+});
+
+test('updateReport allows explicitly clearing or changing categoryId', async () => {
+  const cleared = makeService();
+  await cleared.service.updateReport('u1', REPORT, 1, { categoryId: null } as ReportUpdateInputDto);
+  assert.deepEqual(cleared.updateArgs[0]?.changes, { categoryId: null });
+
+  const changed = makeService();
+  await changed.service.updateReport('u1', REPORT, 1, { categoryId: 'plastic' } as ReportUpdateInputDto);
+  assert.deepEqual(changed.updateArgs[0]?.changes, { categoryId: 'plastic' });
+});
+
+
+test('new reports require an explicit observation source in DTO and service', async () => {
+  for (const observationSource of [undefined, null, 'legacy', 'ai']) {
+    const dto = input({ observationSource } as never);
+    assert.ok((await validate(plainToInstance(ReportInputDto, dto))).some(error => error.property === 'observationSource'));
+    const stub = makeService();
+    await assert.rejects(stub.service.createReport('u1', dto, KEY), error => errorCode(error) === 'VALIDATION_ERROR');
+    assert.equal(stub.state.created, 0);
+  }
+});
+
+test('private observation assertions are persisted separately from observed facts', async () => {
+  const stub = makeService();
+  await stub.service.createReport('u1', input({
+    observationSource: 'secondhand',
+    sourceReference: 'Informasi dari pengurus lingkungan, dengan izin.',
+    inference: 'Diduga terbawa aliran air, belum dipastikan.',
+    contextFlags: ['near_waterway', 'sharp_objects'],
+  }), KEY);
+  assert.equal(stub.createArgs[0]?.observationSource, 'secondhand');
+  assert.equal(stub.createArgs[0]?.sourceReference, 'Informasi dari pengurus lingkungan, dengan izin.');
+  assert.equal(stub.createArgs[0]?.inference, 'Diduga terbawa aliran air, belum dipastikan.');
+  assert.deepEqual(stub.createArgs[0]?.contextFlags, ['near_waterway', 'sharp_objects']);
+  assert.equal(stub.createArgs[0]?.description, input().description);
+});
+
+test('firsthand reports cannot carry a third-party source reference', async () => {
+  const stub = makeService();
+  await assert.rejects(stub.service.createReport('u1', input({ sourceReference: 'A private contact' }), KEY), error => errorCode(error) === 'VALIDATION_ERROR');
+});
+
+test('all new assertions participate in the idempotency hash', async () => {
+  const stub = makeService();
+  const base = input({ observationSource: 'secondhand' });
+  for (const extra of [{}, { inference: 'Possible cause, not observed.' }, { sourceReference: 'Private source with permission.' }, { contextFlags: ['burning'] as const }, { observationSource: 'firsthand' as const }]) {
+    await stub.service.createReport('u1', { ...base, ...extra } as ReportInputDto, KEY);
+  }
+  assert.equal(new Set(stub.createArgs.map(args => args.requestHash)).size, 5);
+});
+
+test('context flags allow observable assertions only, without duplicates or null', async () => {
+  assert.equal((await validate(plainToInstance(ReportInputDto, input({ contextFlags: ['burning', 'near_waterway', 'sharp_objects'] })))).length, 0);
+  for (const contextFlags of [['disease_risk'], ['burning', 'burning'], null, 'burning']) {
+    const dto = plainToInstance(ReportInputDto, input({ contextFlags } as never));
+    assert.ok((await validate(dto)).some(error => error.property === 'contextFlags'));
+  }
+});
+
+test('unsafe photo exception allows a submitted report with no publication consent', async () => {
+  const stub = makeService();
+  const dto = input({ mediaIds: [], photoUnavailableReason: 'unsafe' });
+  assert.equal((await validate(plainToInstance(ReportInputDto, dto))).length, 0);
+  await stub.service.createReport('u1', dto, KEY);
+  assert.deepEqual(stub.createArgs[0]?.mediaIds, []);
+  assert.equal(stub.createArgs[0]?.photoUnavailableReason, 'unsafe');
+  assert.deepEqual(stub.createArgs[0]?.publicationChannels, []);
+});
+
+test('missing photos require the unsafe exception and prohibit publication consent', async () => {
+  for (const extra of [{}, { photoUnavailableReason: 'unsafe', publicationChannels: ['web'] }, { photoUnavailableReason: 'unsafe', publicationChannels: ['instagram'] }]) {
+    const stub = makeService();
+    await assert.rejects(stub.service.createReport('u1', input({ mediaIds: [], ...extra } as never), KEY, true), error => errorCode(error) === 'EVIDENCE_INVALID');
+    assert.equal(stub.state.created, 0);
+  }
+  await assert.rejects(makeService().service.createReport('u1', input({ photoUnavailableReason: 'unsafe' }), KEY), error => errorCode(error) === 'VALIDATION_ERROR');
+});
+
+test('owner can add evidence to an unsafe report and the exception is cleared', async () => {
+  const stub = makeService({ found: record({ evidenceMediaIds: [], photoUnavailableReason: 'unsafe' }) });
+  await stub.service.updateReport('u1', REPORT, 1, { mediaIds: [MEDIA] });
+  assert.deepEqual(stub.updateArgs[0]?.changes, { mediaIds: [MEDIA], photoUnavailableReason: null });
+});
+
+test('owner removing photos must explicitly declare unsafe conditions', async () => {
+  const stub = makeService();
+  await assert.rejects(stub.service.updateReport('u1', REPORT, 1, { mediaIds: [] }), error => errorCode(error) === 'EVIDENCE_INVALID');
+  await stub.service.updateReport('u1', REPORT, 1, { mediaIds: [], photoUnavailableReason: 'unsafe' });
+  assert.deepEqual(stub.updateArgs[0]?.changes, { mediaIds: [], photoUnavailableReason: 'unsafe' });
+});
+
+test('owner can revise provenance and clear private inference without losing observed facts', async () => {
+  const stub = makeService({ found: record({ observationSource: 'secondhand', sourceReference: 'Private source', inference: 'Initial guess' }) });
+  await stub.service.updateReport('u1', REPORT, 1, { observationSource: 'firsthand', inference: null, contextFlags: [] });
+  assert.deepEqual(stub.updateArgs[0]?.changes, { observationSource: 'firsthand', sourceReference: null, inference: null, contextFlags: [] });
+});
+
+test('legacy report views never invent a firsthand attestation', () => {
+  const view = toReportView(record());
+  assert.equal(view.observationSource, null);
+  assert.equal(view.sourceReference, null);
+  assert.equal(view.inference, null);
+  assert.deepEqual(view.contextFlags, []);
+  assert.equal(view.photoUnavailableReason, null);
+});
+
+test('owner and admin private report views include provenance without adding public fields', async () => {
+  const privateRecord = record({ observationSource: 'secondhand', sourceReference: 'Private source', inference: 'Unconfirmed guess', contextFlags: ['burning'] });
+  for (const isAdmin of [false, true]) {
+    const view = await makeService({ found: privateRecord }).service.getReport('u1', isAdmin, REPORT);
+    assert.equal(view.sourceReference, 'Private source');
+    assert.equal(view.inference, 'Unconfirmed guess');
+    assert.deepEqual(view.contextFlags, ['burning']);
+  }
+});
+
+
+test('update DTO rejects null media, unknown provenance, and invalid optional assertions', async () => {
+  for (const [property, value] of [['mediaIds', null], ['observationSource', null], ['observationSource', 'ai'], ['contextFlags', ['disease_risk']], ['inference', 'x'.repeat(1001)], ['sourceReference', ''], ['photoUnavailableReason', 'inconvenient']]) {
+    const dto = plainToInstance(ReportUpdateInputDto, { [property as string]: value });
+    assert.ok((await validate(dto)).some(error => error.property === property), `${String(property)} rejects ${String(value)}`);
+  }
+});
+
+test('an unknown legacy source remains unknown during an unrelated owner edit', async () => {
+  const stub = makeService({ found: record({ observationSource: null }) });
+  await stub.service.updateReport('u1', REPORT, 1, { mediaIds: [MEDIA], inference: 'Possible cause, not established.' });
+  assert.deepEqual(stub.updateArgs[0]?.changes, { mediaIds: [MEDIA], photoUnavailableReason: null, inference: 'Possible cause, not established.' });
+  assert.equal('observationSource' in stub.updateArgs[0]!.changes, false);
+});

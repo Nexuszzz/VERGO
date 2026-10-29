@@ -1,0 +1,27 @@
+{
+  "name": "sap-platform",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "build": "npm run build -w @sap/config && npm run build -w @sap/api && npm run build -w @sap/worker",
+    "dev:api": "npm run dev -w @sap/api",
+    "dev:web": "npm run dev -w @sap/web",
+    "dev:worker": "npm run dev -w @sap/worker",
+    "typecheck": "npm run build -w @sap/config && npm run typecheck -w @sap/config && npm run typecheck -w @sap/api && npm run typecheck -w @sap/worker && npm run typecheck -w @sap/web",
+    "test": "npm run test --workspaces --if-present && npm run test:hermes",
+    "test:community:e2e": "test -n \"$SAP_TEST_DATABASE_URL\" && npm run test:e2e -w @sap/api",
+    "test:hermes": "cd services/hermes-review && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_server.py",
+    "contracts:lint": "node scripts/check-contracts.mjs",
+    "contracts:routes": "node scripts/check-routes.mjs",
+    "contracts:check": "npm run contracts:lint",
+    "check": "npm run contracts:check && npm run typecheck && npm run test && npm run build && npm run contracts:routes"
+  },
+  "engines": { "node": ">=22" },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "typescript": "^5.9.3"
+  }
+}

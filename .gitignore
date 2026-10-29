@@ -1,0 +1,26 @@
+node_modules/
+.next/
+.vercel/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea/
+.vscode/
+dist-test/
+test-results/
+playwright-report/
+
+# Private recovery material and operator credentials
+.vergo-vps-recovery*/
+.vergo-private*/
+backups/
+*.dump
+*.sql.gz
+*.tar.gz
+*.pem
+*.key

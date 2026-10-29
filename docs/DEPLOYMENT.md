@@ -1,0 +1,138 @@
+# DEPLOYMENT — VERGO
+
+Identitas publik: **VERGO — Verify and Go**; asisten: **VERA**. Nama variabel `SAP_*`/`SAPA_*`, package `@sap/*`, serta path layanan yang sudah ada tetap dipakai untuk kompatibilitas.
+
+v1.0 · Pemilik API/data/worker: backend; build frontend: frontend. Target awal satu origin HTTPS dengan reverse proxy.
+
+## 1. Lingkungan dan provider
+
+Development memakai PostgreSQL/PostGIS, Redis native/BullMQ, object storage private kompatibel S3/R2, layanan email dan Gradio. Neon/Upstash adalah opsi managed dari konfigurasi awal; resource lokal atau host sendiri dapat dipakai sesuai environment. Browser memakai Next.js:3000 dan proxy `/api/v1/*` ke NestJS:3001 bila lokal.
+
+Dev, staging dan production wajib memiliki database, queue, bucket, credential email, ML credential dan application secret terpisah. Jangan mengirim email nyata dari fixture/seed. Resend tetap default dan wajib untuk production. Development dapat memakai credential SMTP lama secara eksplisit dengan `MAIL_TRANSPORT=smtp`; mode ini membutuhkan keempat field `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, dan `SMTP_PASSWORD`, tanpa `RESEND_API_KEY`. SMTP memakai TLS, timeout terbatas, dan tidak menulis isi email atau credential ke log. Tidak ada fallback email palsu ketika pengiriman gagal.
+
+Produksi mengikuti `deploy/compose.yml`: web, API, worker, PostgreSQL dan Redis dapat berjalan pada host sendiri. Reverse proxy membagi `/api/v1` ke NestJS dan route lain ke Next.js; worker terpisah. Akses provider eksternal memerlukan TLS, timeout, retry terbatas dan monitoring; koneksi layanan internal mengikuti jaringan privat operator. Cookie host-only dan same-origin API harus konsisten. Rujukan [Next.js rewrites](https://nextjs.org/docs/app/api-reference/config/next-config-js/rewrites).
+
+Bukti historis ada di [ringkasan proyek](RINGKASAN_PROYEK.md); status aktual harus dibuktikan per lingkungan. Penerimaan aktif mengikuti [rencana FunDev](RENCANA_FUNDEV_2026.md#gerbang-rilis) dan [runbook VPS](DEPLOYMENT_VPS.md); smoke provider tidak menggantikan integration test aplikasi.
+
+## 2. Variabel environment kanonik
+
+| Nama | Pemakai | Arti |
+| --- | --- | --- |
+| `APP_ORIGIN` | Web server/API | Origin publik penuh tanpa trailing slash |
+| `API_INTERNAL_URL` | Web server/proxy | URL API server-side, bukan `NEXT_PUBLIC_*` |
+| `DATABASE_URL` | API/worker | PostgreSQL runtime connection; secret; TLS bila melintasi jaringan tak tepercaya |
+| `DATABASE_DIRECT_URL` | Migration/admin | Koneksi langsung opsional untuk migration; secret |
+| `REDIS_URL` | API/worker | Redis native `redis://` pada jaringan privat atau `rediss://` sesuai operator; bukan REST URL/token |
+| `SESSION_SECRET` | API | Secret signing security/session |
+| `CSRF_SECRET` | API | Secret signed double-submit token |
+| `MAIL_TRANSPORT` | API/worker config | `resend` default; `smtp` hanya nonproduction dan harus dipilih eksplisit |
+| `RESEND_API_KEY`, `MAIL_FROM` | API/worker config | Resend HTTPS; API key server-only; key wajib ketika transport Resend |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD` | API | Credential SMTP lama untuk mode development; password server-only; port 465 implicit TLS atau STARTTLS untuk port lain |
+| `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | API/worker | R2 private via S3 API |
+| `ML_INFERENCE_URL` | Worker | Base URL Gradio, bukan raw call endpoint |
+| `ML_API_NAME` | Worker | `/predict_gradio` |
+| `ML_USERNAME`, `ML_PASSWORD` | Worker | HTTP Basic reverse proxy; secret |
+| `ML_TIMEOUT_MS` | Worker | `90000` baseline |
+| `DB_HEALTH_TIMEOUT_MS` | API | `10000`; cold-start budget probe readiness DB (Neon scale-to-zero) |
+| `SAPA_FEATURE_ENABLED` | API | `false` kill switch VERA; `true` wajib set trio `SAPA_LLM_*` |
+| `SAPA_LLM_BASE_URL` | API | Base URL provider OpenAI-compatible (`{BASE_URL}/chat/completions`) |
+| `SAPA_LLM_API_KEY` | API | Bearer key provider; secret, hanya di env/secret manager |
+| `SAPA_LLM_MODEL` | API | Nama model chat completions |
+| `SAPA_LLM_TIMEOUT_MS`, `SAPA_LLM_MAX_OUTPUT_TOKENS`, `SAPA_LLM_TEMPERATURE` | API | `30000` / `500` / `0.3` |
+| `SAPA_CHAT_RATE_LIMIT_PER_MINUTE` | API | `20`; throttle chat per akun |
+| `NEXT_PUBLIC_MAP_STYLE_URL` | Web | Style/tiles; browser key harus scoped |
+| `CONTRACT_VERSION` | API/web | `1.1.0` |
+| `NODE_ENV`, `LOG_LEVEL` | Server | Runtime |
+
+Repo hanya menyediakan `.env.example` berisi placeholder. Nilai nyata disimpan di secret manager/`.env` runtime; `.env*` diabaikan kecuali `.env.example`. Dilarang menaruh password, token, connection string, deployment URL aktual, Authorization header, foto atau koordinat tepat di docs/log/CI.
+
+Origin allowlist berasal dari `APP_ORIGIN`. R2 tetap privat; upload melalui API sehingga direct-upload CORS tidak diperlukan. Signed read URL berumur pendek.
+
+API mencatat `APP_ORIGIN` dan `API_INTERNAL_URL` yang teresolusi saat startup (log `Bootstrap`, non-secret) agar salah konfigurasi origin langsung terlihat. Saat guard CSRF menolak permintaan karena origin tidak cocok, API mencatat `received` vs `expected` origin (tanpa token) di level `warn` — gunakan ini untuk mendiagnosis `APP_ORIGIN` yang salah di produksi.
+
+## 3. Repository dan bootstrap
+
+Target: [github.com/sitaurs/VERGO](https://github.com/sitaurs/VERGO), dengan struktur implementasi:
+
+```text
+apps/web
+apps/api
+apps/worker
+apps/api/migrations
+packages/config
+contracts
+deploy
+scripts
+services/hermes-review
+docs
+```
+
+`ecoLens`/`ecoLens_ML` adalah referensi read-only; jangan disalin, dijadikan subtree/submodule, atau di-commit. Jangan `git init` di direktori induk checkout legacy. `.gitignore` melindungi `.env*` kecuali `.env.example`, bobot model, media lokal, log, coverage, build dan cache.
+
+Script wajib: `dev`, `build`, `lint`, `typecheck`, `db:migrate`, `db:seed`, `contracts:lint`, `contracts:types`, `contracts:fixtures`, `contracts:check`, `test`, `test:contract`, `test:e2e`. Seed admin hanya non-production; password tidak dicetak.
+
+Urutan bootstrap:
+
+1. Checkout bersih, runtime dan frozen lockfile.
+2. Resource/secret development terpisah; startup memvalidasi env tanpa mencetak nilai.
+3. Uji Neon pooled/direct dari runtime target; migration termasuk `CREATE EXTENSION IF NOT EXISTS postgis`.
+4. Generate/verify contract; start API dan worker.
+5. Uji BullMQ/reconnect/replay outbox pada Upstash.
+6. Uji R2 upload, signed read dan cleanup.
+7. Uji auth/CSRF dan email sandbox.
+8. Jalankan Gradio discovery, model-aware readiness dan scan smoke.
+9. Start proxy/frontend dan E2E.
+
+Build frontend sukses tidak berarti API/worker/provider/model sehat.
+
+## 4. Gradio self-hosted
+
+Runtime ditemukan: Gradio 6.26, prefix `/gradio_api`, endpoint `/predict_gradio`, input `img` Image/Buffer, output `LabelData`. Basic Auth diterapkan reverse proxy. Worker memakai `@gradio/client` pada base URL dengan custom `Authorization` header, bukan native auth option atau raw call endpoint.
+
+Baseline VPS 4 GB/2 vCPU, CPU-only, satu process dan concurrency 1 sampai benchmark selesai. Deployment wajib:
+
+- Python 3.10 dan dependency dipin;
+- materialize kedua bobot Git LFS dan verifikasi hash;
+- deklarasikan `timm`/arsitektur benar;
+- model path/working directory eksplisit;
+- readiness gagal pada missing/unexpected checkpoint key;
+- cek binary+multiclass serta known-positive/negative;
+- hasilkan `providerRevision` dari source commit, checkpoint hash dan runtime version;
+- restart policy, resource limit, liveness/readiness terpisah;
+- tidak log Basic Auth, credential, gambar atau payload sensitif.
+
+Root HTTP 200 hanya liveness. Detail ada di [ML_INTEGRATION.md](ML_INTEGRATION.md).
+
+### Production worker-to-Gradio private route
+
+When EcoLens runs as a container on the same VPS as the SAP worker, connect both containers to an internal Docker network (production currently uses `sap-ml-private`) and give the EcoLens service the network alias `ml-inference`. Set the worker's `ML_INFERENCE_URL` to the internal base URL `http://ml-inference:7860`; keep Basic Auth credentials in the server-side environment. Persist the shared network and worker attachment in the production Compose configuration before a redeploy. Do not expose the model port publicly just to connect the worker. A successful `/gradio_api/info` request or a single synthetic inference is only a connectivity smoke; it does not replace model-aware readiness or scan E2E.
+
+## 5. CI/CD
+
+1. Frozen install; lint/typecheck; validate OpenAPI/fixture.
+2. Generate client + git-diff gate; unit/contract test; build web/API/worker.
+3. Migration database isolated; integration test PostGIS, queue dan adapter R2.
+4. Deploy staging: additive migration → API → worker → web; E2E dan ML probe.
+5. Production setelah acceptance; smoke auth/scan/report/map dengan data tes yang dibersihkan.
+
+Catat image/release ID, commit kontrak dan `providerRevision`. Mixed-version rollout harus kompatibel; jangan hapus schema saat release lama masih menggunakannya.
+
+## 6. Backup, pemulihan dan rotasi
+
+- Neon: tetapkan retention sesuai plan dan uji restore staging.
+- R2: inventaris checksum, lifecycle dan restore; objek bukan pengganti metadata DB.
+- Upstash: bukan source of truth; rebuild queue dari outbox/database dan unique constraint.
+- Email/ML: simpan runbook failover tanpa credential di repo.
+- Rotasi credential Neon, Upstash, R2, Resend, ML Basic Auth, session dan CSRF dengan overlap/revocation teruji.
+
+Baseline target RPO 24 jam/RTO 8 jam harus dibuktikan. Restore: DB → deletion tombstones → reconcile outbox/queue/ledger → objek R2 → area snapshot → smoke → buka traffic. Restore tidak boleh menghidupkan kembali data wajib-hapus.
+
+Rollback aplikasi hanya ke release kompatibel schema; destructive migration tidak di-rollback otomatis. Jika ML outage, scan dapat dinonaktifkan dengan feature flag dan 503 sementara, sedangkan report/map tetap berjalan.
+
+## 7. Monitoring dan runbook
+
+Monitor error API, p95 non-ML, Neon, queue age/reconnect Upstash, scan timeout, ML liveness/readiness/providerRevision, CPU/RAM VPS, email send/deliverability, R2 cleanup, oldest submitted report dan snapshot staleness.
+
+Log memakai requestId/scanId/reportId tanpa token, password, Authorization, foto atau koordinat tepat. `GET /api/v1/health/live` hanya memeriksa proses dan tidak menghubungi dependency. `GET /api/v1/health/ready` memeriksa DB, Redis, dan R2 dengan timeout terbatas; hanya status generik `ok`/`unavailable` yang dikembalikan, tanpa URL/provider error/credential. DB gagal → HTTP 503 dan tolak mutation; Redis atau R2 gagal → HTTP 200 `degraded` dengan komponen yang gagal terlihat, supaya pembacaan DB yang aman tetap tersedia. `GET /api/v1/health` tetap response contract 1.1.0 lama. Route live/ready tercatat di draft R1, bukan contract published 1.1.0. Redis hilang → replay outbox; R2 gagal → jangan membuat media seolah selesai; ML 401/403 → configuration incident tanpa retry tak terbatas.
+
+Rujukan: [NestJS queues/BullMQ](https://docs.nestjs.com/techniques/queues). Dokumen tidak menjanjikan SLA/biaya provider.

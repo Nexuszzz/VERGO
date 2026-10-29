@@ -1,0 +1,53 @@
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import type { AppConfig } from '@sap/config';
+
+/** Reads normalized media bytes back from R2 for inference (worker side). */
+export class ObjectStore {
+  private client: S3Client | null = null;
+
+  constructor(private readonly config: AppConfig) {}
+
+  async putObject(input: { key: string; body: Buffer; contentType: string; sha256: string }): Promise<void> {
+    await this.getClient().send(new PutObjectCommand({ Bucket:this.config.S3_BUCKET,Key:input.key,
+      Body:input.body,ContentType:input.contentType,ChecksumSHA256:Buffer.from(input.sha256,'hex').toString('base64') }), {abortSignal:AbortSignal.timeout(60000)});
+  }
+
+  async getObject(key: string): Promise<Buffer> {
+    const client = this.getClient();
+    const response = await client.send(
+      new GetObjectCommand({ Bucket: this.config.S3_BUCKET, Key: key }),
+      {abortSignal:AbortSignal.timeout(60000)},
+    );
+    const body = response.Body;
+    if (!body) throw new Error('empty object body');
+    const chunks: Buffer[] = [];
+    for await (const chunk of body as AsyncIterable<Uint8Array>) {
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * Explicitly delete an object from R2. SQL cascade alone is not enough — the
+   * deletion job must remove the R2 object before the owning row is pseudonymised
+   * (DATABASE.md §7). Deleting a missing key is a no-op on S3-compatible stores.
+   */
+  async deleteObject(key: string): Promise<void> {
+    const client = this.getClient();
+    await client.send(new DeleteObjectCommand({ Bucket: this.config.S3_BUCKET, Key: key }), {abortSignal:AbortSignal.timeout(60000)});
+  }
+
+  private getClient(): S3Client {
+    if (this.client) return this.client;
+    this.client = new S3Client({
+      region: this.config.S3_REGION,
+      endpoint: this.config.S3_ENDPOINT,
+      forcePathStyle: true,
+      credentials: {
+        accessKeyId: this.config.S3_ACCESS_KEY_ID,
+        secretAccessKey: this.config.S3_SECRET_ACCESS_KEY,
+      },
+    });
+    return this.client;
+  }
+}
